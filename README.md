@@ -6,6 +6,8 @@ It is built for one job: take clean, polite audio and give it weight, bite, heat
 
 Nebula Cluster is released under the MIT license. It is not proprietary software.
 
+<img width="1183" height="792" alt="Image" src="https://github.com/user-attachments/assets/fda701db-caec-4143-b677-3e70041636d4" />
+
 ## The Sound
 
 Nebula Cluster is not a transparent utility plugin pretending to be exciting. It is a character box.
