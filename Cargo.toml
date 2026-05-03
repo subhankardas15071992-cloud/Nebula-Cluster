@@ -3,7 +3,7 @@ name = "nebula_cluster"
 version = "1.0.0"
 edition = "2021"
 authors = ["Nebula Audio"]
-license = "MIT"
+license = "AGPL-3.0-or-later"
 description = "Nebula Cluster free open-source CLAP and VST3 audio effect"
 publish = false
 
