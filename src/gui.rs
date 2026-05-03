@@ -301,7 +301,7 @@ fn draw_header(ui: &mut Ui, rect: Rect, scale: f32) {
     painter.text(
         Pos2::new(rect.min.x + 22.0 * scale, rect.center().y + 18.0),
         egui::Align2::LEFT_CENTER,
-        "Made by Nebula Audio  |  MIT open-source  |  v1.0",
+        "Made by Nebula Audio  |  v1.0",
         FontId::new(scaled_font(12.0, scale), FontFamily::Proportional),
         TEXT_DIM,
     );
