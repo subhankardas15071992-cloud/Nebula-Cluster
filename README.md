@@ -300,6 +300,20 @@ The project includes automated checks for audio behavior, stability, state reset
 ---
 Pre-built CLAP and VST3 binaries can be bought from Gumroad:
 https://subhankar42.gumroad.com/l/mdhqe
+
+Note:
+For users new to CLAP plugins, they can sometimes look like folders on macOS, but the name of the folder has ".clap" in it like a file extension. It's perfectly normal.
+
+Note:
+The zip files contain both CLAP and VST3 plugins.
+
+Note for macOS users:
+macOS Gatekeeper blocks the binary because it has no code signature. Locally-built binaries are trusted automatically; externally built ones are flagged as "from the internet".
+
+To fix this problem after unzipping run the following command:
+```xattr -dr com.apple.quarantine [path of the Nebula Cluster.clap or Nebula Cluster.vst3 file]```
+
+After that you can copy it to either /Library/Audio/Plug-Ins/CLAP or /Library/Audio/Plug-Ins/VST3 (if you want to install it for all users) or ~/Library/Audio/Plug-Ins/CLAP/ or ~/Library/Audio/Plug-Ins/VST3/ (if you want to install it for only the current user)
 ---
 
 ## License
