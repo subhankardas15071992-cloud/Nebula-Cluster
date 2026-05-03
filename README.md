@@ -297,6 +297,11 @@ Run the audio evaluation helper:
 
 The project includes automated checks for audio behavior, stability, state reset, sample-rate switching, randomized stress cases, and extreme-gain output safety.
 
+---
+Pre-built CLAP and VST3 binaries can be bought from Gumroad:
+https://subhankar42.gumroad.com/l/mdhqe
+---
+
 ## License
 
 Nebula Cluster is free open-source software under the MIT license. See `LICENSE` for the full license text.
