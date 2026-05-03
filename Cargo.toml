@@ -1,0 +1,37 @@
+[package]
+name = "nebula_cluster"
+version = "1.0.0"
+edition = "2021"
+authors = ["Nebula Audio"]
+license = "MIT"
+description = "Nebula Cluster free open-source CLAP and VST3 audio effect"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[workspace]
+members = ["xtask"]
+resolver = "2"
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", default-features = false, features = ["vst3"] }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+parking_lot = "0.12"
+rand = "0.8"
+rustfft = "6.2"
+
+[dev-dependencies]
+approx = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+overflow-checks = false
+debug-assertions = false
+
+[profile.release.build-override]
+opt-level = 3
+codegen-units = 1
