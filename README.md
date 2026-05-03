@@ -4,7 +4,7 @@
 
 It is built for one job: take clean, polite audio and give it weight, bite, heat, movement, and attitude. Put it on drums, bass, synths, vocals, guitars, loops, rooms, buses, or anything that needs to stop behaving.
 
-Nebula Cluster is released under the MIT license. It is not proprietary software.
+Nebula Cluster is released under the GNU Affero General Public License v3.0 (AGPL-3.0-or-later) license. It is not proprietary software.
 
 <img width="1183" height="791" alt="Image" src="https://github.com/user-attachments/assets/ba6f8e12-1e4b-4f07-964a-04954ed06a99" />
 
@@ -338,4 +338,4 @@ After that you can copy it to either /Library/Audio/Plug-Ins/CLAP or /Library/Au
 
 ## License
 
-Nebula Cluster is free open-source software under the MIT license. See `LICENSE` for the full license text.
+GNU Affero General Public License v3.0 (AGPL-3.0-or-later) — free to use, modify, and distribute under copyleft terms.
