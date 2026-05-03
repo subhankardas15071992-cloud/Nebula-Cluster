@@ -241,18 +241,41 @@ Try these starting points:
 
 ## Building From Source
 
-Nebula Cluster can be built locally with the included scripts.
+Nebula Cluster is built manually from source with Rust and Cargo. The repository does not ship one-click build scripts.
+
+Before building, install a stable Rust toolchain. On macOS, install Apple Command Line Tools. On Linux, install the usual development packages for OpenGL, X11/XCB, fontconfig, freetype, GTK, and ALSA for your distribution.
+
+For a clean release build, run the checks first:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --release -- --test-threads=1
+```
 
 ### macOS Universal
 
+Add both Apple targets:
+
 ```sh
-./scripts/build_macos_universal.sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
+Then build the Universal CLAP and VST3 bundles:
+
+```sh
+export CARGO_INCREMENTAL=0
+export MACOSX_DEPLOYMENT_TARGET=11.0
+cargo xtask bundle-universal nebula_cluster --release
 ```
 
 ### Linux x86_64
 
+Build the Linux CLAP and VST3 bundles:
+
 ```sh
-./scripts/build_linux_x86_64.sh
+export CARGO_INCREMENTAL=0
+cargo xtask bundle nebula_cluster --release
 ```
 
 Build output is written to:
@@ -294,9 +317,6 @@ Run the audio evaluation helper:
 ```sh
 ./scripts/run_audio_evaluation.sh
 ```
-
-The project includes automated checks for audio behavior, stability, state reset, sample-rate switching, randomized stress cases, and extreme-gain output safety.
-
 ---
 Pre-built CLAP and VST3 binaries can be bought from Gumroad:
 https://subhankar42.gumroad.com/l/mdhqe
