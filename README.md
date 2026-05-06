@@ -44,17 +44,19 @@ It is especially good for:
 
 - CLAP
 - VST3
+- AUv2 on macOS
 
 ## Platforms
 
 - macOS Universal: Apple Silicon and Intel
+- Windows x86_64
 - Linux x86_64
 
 Nebula Cluster is 64-bit only.
 
 ## Interface
 
-The editor uses a deep black neon sci-fi look with resizable controls. The main analyzer stays visible globally while the effect sections live in tabs, so you can shape the sound without losing sight of the output.
+The editor uses a deep black neon sci-fi look with resizable controls. The main analyzer stays visible globally while the effect sections live in tabs, so you can shape the sound without losing sight of the output. macOS and Linux use the existing egui editor; Windows uses a native Direct2D editor path for DAW compatibility.
 
 The UI includes:
 
@@ -243,7 +245,7 @@ Try these starting points:
 
 Nebula Cluster is built manually from source with Rust and Cargo. The repository does not ship one-click build scripts.
 
-Before building, install a stable Rust toolchain. On macOS, install Apple Command Line Tools. On Linux, install the usual development packages for OpenGL, X11/XCB, fontconfig, freetype, GTK, and ALSA for your distribution.
+Before building, install a stable Rust toolchain. On macOS, install Apple Command Line Tools. On Windows, use the `x86_64-pc-windows-msvc` target with the Visual Studio Build Tools C++ toolchain. On Linux, install the usual development packages for OpenGL, X11/XCB, fontconfig, freetype, GTK, and ALSA for your distribution.
 
 For a clean release build, run the checks first:
 
@@ -261,13 +263,30 @@ Add both Apple targets:
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 ```
 
-Then build the Universal CLAP and VST3 bundles:
+Then build the Universal CLAP, VST3, and AUv2 bundles:
 
 ```sh
-export CARGO_INCREMENTAL=0
-export MACOSX_DEPLOYMENT_TARGET=11.0
-cargo xtask bundle-universal nebula_cluster --release
+./build_mac.sh
 ```
+
+The AUv2 output is `target/bundled/Nebula Cluster.component`.
+
+### Windows x86_64
+
+Add the Windows target:
+
+```sh
+rustup target add x86_64-pc-windows-msvc
+```
+
+Then build the Windows CLAP and VST3 bundles:
+
+```sh
+set CARGO_INCREMENTAL=0
+cargo xtask bundle nebula_cluster --release --target x86_64-pc-windows-msvc
+```
+
+The Windows build uses the native Direct2D editor instead of the egui editor.
 
 ### Linux x86_64
 
@@ -293,6 +312,7 @@ Common macOS locations:
 ```text
 ~/Library/Audio/Plug-Ins/CLAP/
 ~/Library/Audio/Plug-Ins/VST3/
+~/Library/Audio/Plug-Ins/Components/
 ```
 
 Common Linux user locations:
@@ -300,6 +320,13 @@ Common Linux user locations:
 ```text
 ~/.clap/
 ~/.vst3/
+```
+
+Common Windows user locations:
+
+```text
+%LOCALAPPDATA%\Programs\Common\CLAP\
+%COMMONPROGRAMFILES%\VST3\
 ```
 
 Then rescan plugins in your DAW or plugin host.
@@ -317,23 +344,9 @@ Run the audio evaluation helper:
 ```sh
 ./scripts/run_audio_evaluation.sh
 ```
----
-Pre-built CLAP and VST3 binaries can be bought from Gumroad:
-https://subhankar42.gumroad.com/l/mdhqe
 
-Note:
-For users new to CLAP plugins, they can sometimes look like folders on macOS, but the name of the folder has ".clap" in it like a file extension. It's perfectly normal.
+The project includes automated checks for audio behavior, stability, state reset, sample-rate switching, randomized stress cases, and extreme-gain output safety.
 
-Note:
-The zip files contain both CLAP and VST3 plugins.
-
-Note for macOS users:
-macOS Gatekeeper blocks the binary because it has no code signature. Locally-built binaries are trusted automatically; externally built ones are flagged as "from the internet".
-
-To fix this problem after unzipping run the following command:
-```xattr -dr com.apple.quarantine [path of the Nebula Cluster.clap or Nebula Cluster.vst3 file]```
-
-After that you can copy it to either /Library/Audio/Plug-Ins/CLAP or /Library/Audio/Plug-Ins/VST3 (if you want to install it for all users) or ~/Library/Audio/Plug-Ins/CLAP/ or ~/Library/Audio/Plug-Ins/VST3/ (if you want to install it for only the current user)
 ---
 
 ## License
