@@ -36,22 +36,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, KillTimer,
     LoadCursorW, RegisterClassW, SetTimer, SetWindowLongPtrW, ShowWindow, CREATESTRUCTW,
     CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, IDC_ARROW, SW_SHOW, WINDOW_EX_STYLE,
-    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    WM_CANCELMODE, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 use windows_numerics::Vector2;
 
 use super::analyzer::AnalyzerData;
-use super::model::{format_value, ControlId, Snapshot, ValueKind};
+use super::model::{format_value, ControlId, Snapshot, ValueKind, ALL_CONTROLS};
 use super::{
     apply_midi_cc_changes, set_control, snapshot_from_params, u32_to_f32, Meters, MidiLearnShared,
     NebulaClusterParams, MIDI_WAITING_FOR_CONTROL,
 };
 
-const BASE_W: f32 = 1180.0;
-const BASE_H: f32 = 760.0;
+const BASE_W: f32 = 980.0;
+const BASE_H: f32 = 640.0;
 const TIMER_ID: usize = 9107;
-const TIMER_MS: u32 = 33;
+const TIMER_MS: u32 = 50;
+const MAX_UNDO: usize = 64;
 
 const GLOBAL_CONTROLS: &[ControlId] = &[
     ControlId::InputLevel,
@@ -139,8 +141,8 @@ impl Editor for NativeEditor {
         }
 
         let scale = f32::from_bits(self.scale_bits.load(Ordering::Acquire)).clamp(0.5, 3.0);
-        let width = (BASE_W * scale).round() as i32;
-        let height = (BASE_H * scale).round() as i32;
+        let width = BASE_W.round() as i32;
+        let height = BASE_H.round() as i32;
 
         let state = Box::new(NativeWindowState::new(
             self.params.clone(),
@@ -230,6 +232,13 @@ struct NativeWindowState {
     text_formats: Option<TextFormats>,
     active_tab: Tab,
     drag: Option<DragState>,
+    drag_snapshot: Option<Snapshot>,
+    presets: Vec<(String, Snapshot)>,
+    preset_name_counter: usize,
+    selected_preset: Option<usize>,
+    preset_menu_open: bool,
+    undo_stack: Vec<Snapshot>,
+    redo_stack: Vec<Snapshot>,
     scale: f32,
 }
 
@@ -255,6 +264,13 @@ impl NativeWindowState {
             text_formats: None,
             active_tab: Tab::Global,
             drag: None,
+            drag_snapshot: None,
+            presets: Vec::new(),
+            preset_name_counter: 1,
+            selected_preset: None,
+            preset_menu_open: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             scale,
         }
     }
@@ -289,6 +305,7 @@ impl NativeWindowState {
         self.draw_meters(&rt, &brushes, &formats, &layout);
         self.draw_tabs(&rt, &brushes, &formats, &layout);
         self.draw_controls(&rt, &brushes, &formats, &layout, snapshot);
+        self.draw_preset_menu(&rt, &brushes, &formats, &layout);
 
         if unsafe { rt.EndDraw(None, None) }.is_err() {
             self.render_target = None;
@@ -426,6 +443,61 @@ impl NativeWindowState {
             1.0,
         );
 
+        self.draw_button(
+            rt,
+            brushes,
+            formats,
+            layout.save_button,
+            "Save",
+            false,
+            Accent::Cyan,
+        );
+
+        let preset_label = self
+            .selected_preset
+            .and_then(|index| self.presets.get(index))
+            .map(|(name, _)| name.as_str())
+            .unwrap_or("Presets");
+        self.draw_button(
+            rt,
+            brushes,
+            formats,
+            layout.preset_button,
+            preset_label,
+            self.preset_menu_open,
+            Accent::Cyan,
+        );
+
+        self.draw_button(
+            rt,
+            brushes,
+            formats,
+            layout.delete_button,
+            "Delete",
+            self.selected_preset.is_some(),
+            Accent::Red,
+        );
+
+        self.draw_button(
+            rt,
+            brushes,
+            formats,
+            layout.undo_button,
+            "Undo",
+            !self.undo_stack.is_empty(),
+            Accent::Purple,
+        );
+
+        self.draw_button(
+            rt,
+            brushes,
+            formats,
+            layout.redo_button,
+            "Redo",
+            !self.redo_stack.is_empty(),
+            Accent::Purple,
+        );
+
         let bypass = snapshot.bool(ControlId::FxBypass);
         self.draw_button(
             rt,
@@ -469,6 +541,70 @@ impl NativeWindowState {
         );
     }
 
+    fn draw_preset_menu(
+        &self,
+        rt: &ID2D1HwndRenderTarget,
+        brushes: &Brushes,
+        formats: &TextFormats,
+        layout: &Layout,
+    ) {
+        if !self.preset_menu_open {
+            return;
+        }
+
+        let s = layout.s;
+        let Some((menu, row_h)) = preset_menu_rect(layout, self.presets.len()) else {
+            return;
+        };
+        fill_round(rt, menu, 7.0 * s, &brushes.panel_dark);
+        stroke_round(rt, menu, 7.0 * s, &brushes.cyan_dim, 1.0);
+
+        if self.presets.is_empty() {
+            draw_text(
+                rt,
+                "No saved presets",
+                menu.shrink(6.0 * s),
+                &formats.small,
+                &brushes.text_dim,
+                Align::Center,
+            );
+            return;
+        }
+
+        for (index, (name, _)) in self.presets.iter().take(8).enumerate() {
+            let row = UiRect::new(
+                menu.x + 5.0 * s,
+                menu.y + 5.0 * s + row_h * index as f32,
+                menu.w - 10.0 * s,
+                row_h,
+            );
+            let selected = self.selected_preset == Some(index);
+            fill_round(
+                rt,
+                row,
+                4.0 * s,
+                if selected {
+                    &brushes.cyan_soft
+                } else {
+                    &brushes.card
+                },
+            );
+            draw_text(
+                rt,
+                name,
+                UiRect::new(row.x + 8.0 * s, row.y, row.w - 16.0 * s, row.h),
+                &formats.small,
+                if selected {
+                    &brushes.cyan
+                } else {
+                    &brushes.text_secondary
+                },
+                Align::Leading,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn draw_button(
         &self,
         rt: &ID2D1HwndRenderTarget,
@@ -564,7 +700,11 @@ impl NativeWindowState {
             draw_line(rt, x, graph.y, x, graph.bottom(), &brushes.grid, 0.7);
         }
 
-        let data = self.analyzer.lock().clone();
+        let data = self
+            .analyzer
+            .try_lock()
+            .map(|data| data.clone())
+            .unwrap_or_default();
         let nyquist = (data.sample_rate as f32 * 0.5).max(1.0);
         let mags = &data.magnitudes_db;
         let mut prev = None;
@@ -624,6 +764,7 @@ impl NativeWindowState {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_meter(
         &self,
         rt: &ID2D1HwndRenderTarget,
@@ -637,38 +778,32 @@ impl NativeWindowState {
     ) {
         card(rt, rect, 8.0 * rect.scale_hint(), brushes);
         let s = rect.scale_hint();
+        let inner = rect.shrink(9.0 * s);
         draw_text(
             rt,
             label,
-            UiRect::new(
-                rect.x + 10.0 * s,
-                rect.y + 8.0 * s,
-                rect.w - 20.0 * s,
-                16.0 * s,
-            ),
+            UiRect::new(inner.x, inner.y, inner.w, 16.0 * s),
             &formats.small,
             &brushes.text_dim,
             Align::Leading,
         );
+        let value_rect = UiRect::new(
+            inner.x,
+            inner.y + 19.0 * s,
+            inner.w,
+            (inner.h - 35.0 * s).max(20.0 * s),
+        );
+        fill_round(rt, value_rect, 4.0 * s, &brushes.black);
+        stroke_round(rt, value_rect, 4.0 * s, &brushes.border, 1.0);
         draw_text(
             rt,
             &format!("{value_db:.1} dB"),
-            UiRect::new(
-                rect.x + 10.0 * s,
-                rect.y + 28.0 * s,
-                rect.w - 20.0 * s,
-                22.0 * s,
-            ),
+            value_rect,
             &formats.body_bold,
             accent.brush(brushes),
-            Align::Leading,
+            Align::Center,
         );
-        let track = UiRect::new(
-            rect.x + 12.0 * s,
-            rect.bottom() - 22.0 * s,
-            rect.w - 24.0 * s,
-            8.0 * s,
-        );
+        let track = UiRect::new(inner.x, rect.bottom() - 20.0 * s, inner.w, 8.0 * s);
         fill_round(rt, track, 4.0 * s, &brushes.control);
         let fill = UiRect::new(track.x, track.y, track.w * norm.clamp(0.0, 1.0), track.h);
         fill_round(rt, fill, 4.0 * s, accent.brush(brushes));
@@ -761,53 +896,45 @@ impl NativeWindowState {
             );
         }
 
-        for row in control_rows(layout, self.active_tab) {
-            self.draw_control_row(rt, brushes, formats, row, snapshot);
+        for cell in control_cells(layout, self.active_tab) {
+            self.draw_control_cell(rt, brushes, formats, cell, snapshot);
         }
     }
 
-    fn draw_control_row(
+    fn draw_control_cell(
         &self,
         rt: &ID2D1HwndRenderTarget,
         brushes: &Brushes,
         formats: &TextFormats,
-        row: ControlRow,
+        cell: ControlCell,
         snapshot: Snapshot,
     ) {
-        let id = row.id;
+        let id = cell.id;
         let spec = id.spec();
         let value = snapshot.get(id);
-        let s = row.rect.scale_hint();
-        fill_round(rt, row.rect, 6.0 * s, &brushes.row);
-        stroke_round(rt, row.rect, 6.0 * s, &brushes.border, 1.0);
+        let s = cell.rect.scale_hint();
+        fill_round(rt, cell.rect, 6.0 * s, &brushes.row);
+        stroke_round(rt, cell.rect, 6.0 * s, &brushes.border, 1.0);
         draw_text(
             rt,
             spec.name,
             UiRect::new(
-                row.rect.x + 10.0 * s,
-                row.rect.y + 5.0 * s,
-                row.label_w - 12.0 * s,
-                row.rect.h - 10.0 * s,
+                cell.rect.x + 7.0 * s,
+                cell.rect.y + 4.0 * s,
+                cell.rect.w - 14.0 * s,
+                17.0 * s,
             ),
             &formats.small,
             &brushes.text_secondary,
-            Align::Leading,
-        );
-        draw_text(
-            rt,
-            &format_value(id, value),
-            row.value_rect,
-            &formats.small,
-            self.active_tab.accent().brush(brushes),
-            Align::Trailing,
+            Align::Center,
         );
 
         match spec.kind {
             ValueKind::Boolean => {
                 let active = value >= 0.5;
                 let pill = UiRect::new(
-                    row.track.right() - 54.0 * s,
-                    row.track.y - 5.0 * s,
+                    cell.knob_rect.x + cell.knob_rect.w * 0.5 - 26.0 * s,
+                    cell.knob_rect.center_y() - 11.0 * s,
                     52.0 * s,
                     22.0 * s,
                 );
@@ -840,18 +967,18 @@ impl NativeWindowState {
                 fill_circle(rt, knob_x, pill.center_y(), 7.0 * s, &brushes.text_primary);
             }
             ValueKind::Choice(labels) => {
-                fill_round(rt, row.track, 4.0 * s, &brushes.control);
-                let segment_w = row.track.w / labels.len().max(1) as f32;
+                fill_round(rt, cell.segment_rect, 4.0 * s, &brushes.control);
+                let segment_w = cell.segment_rect.w / labels.len().max(1) as f32;
                 let selected = value
                     .round()
                     .clamp(0.0, labels.len().saturating_sub(1) as f64)
                     as usize;
                 for (index, label) in labels.iter().enumerate() {
                     let segment = UiRect::new(
-                        row.track.x + segment_w * index as f32,
-                        row.track.y,
+                        cell.segment_rect.x + segment_w * index as f32,
+                        cell.segment_rect.y,
                         segment_w,
-                        row.track.h,
+                        cell.segment_rect.h,
                     );
                     if index == selected {
                         fill_round(
@@ -874,46 +1001,30 @@ impl NativeWindowState {
                         Align::Center,
                     );
                 }
-                stroke_round(rt, row.track, 4.0 * s, &brushes.border, 1.0);
+                stroke_round(rt, cell.segment_rect, 4.0 * s, &brushes.border, 1.0);
             }
             _ => {
-                let norm = spec.unit_from_value(value) as f32;
-                let center_y = row.track.center_y();
-                draw_line(
+                draw_knob(
                     rt,
-                    row.track.x,
-                    center_y,
-                    row.track.right(),
-                    center_y,
-                    &brushes.control,
-                    6.0 * s,
-                );
-                draw_line(
-                    rt,
-                    row.track.x,
-                    center_y,
-                    row.track.x + row.track.w * norm,
-                    center_y,
-                    self.active_tab.accent().brush(brushes),
-                    6.0 * s,
-                );
-                fill_circle(
-                    rt,
-                    row.track.x + row.track.w * norm,
-                    center_y,
-                    7.0 * s,
-                    &brushes.text_primary,
-                );
-                stroke_circle(
-                    rt,
-                    row.track.x + row.track.w * norm,
-                    center_y,
-                    7.0 * s,
-                    self.active_tab.accent().brush(brushes),
-                    1.2 * s,
+                    cell.knob_rect,
+                    spec.unit_from_value(value) as f32,
+                    self.active_tab.accent(),
+                    brushes,
+                    s,
                 );
             }
         }
+
+        fill_round(rt, cell.value_rect, 4.0 * s, &brushes.black);
+        stroke_round(rt, cell.value_rect, 4.0 * s, &brushes.border, 1.0);
+        draw_text(
+            rt,
+            &format_value(id, value),
+            cell.value_rect,
+            &formats.tiny,
+            self.active_tab.accent().brush(brushes),
+            Align::Center,
+        );
     }
 
     fn mouse_down(&mut self, x: f32, y: f32) {
@@ -923,7 +1034,37 @@ impl NativeWindowState {
         };
         let layout = Layout::new(size.0 as f32, size.1 as f32, self.scale);
 
+        if self.handle_preset_menu_click(x, y, &layout) {
+            invalidate(self.hwnd);
+            return;
+        }
+        if layout.save_button.contains(x, y) {
+            self.save_preset();
+            invalidate(self.hwnd);
+            return;
+        }
+        if layout.preset_button.contains(x, y) {
+            self.preset_menu_open = !self.preset_menu_open;
+            invalidate(self.hwnd);
+            return;
+        }
+        if layout.delete_button.contains(x, y) {
+            self.delete_selected_preset();
+            invalidate(self.hwnd);
+            return;
+        }
+        if layout.undo_button.contains(x, y) {
+            self.undo();
+            invalidate(self.hwnd);
+            return;
+        }
+        if layout.redo_button.contains(x, y) {
+            self.redo();
+            invalidate(self.hwnd);
+            return;
+        }
         if layout.bypass_button.contains(x, y) {
+            self.push_undo_snapshot(snapshot_from_params(&self.params));
             self.toggle_control(ControlId::FxBypass);
             invalidate(self.hwnd);
             return;
@@ -942,40 +1083,48 @@ impl NativeWindowState {
             }
         }
 
-        for row in control_rows(&layout, self.active_tab) {
-            if !row.rect.contains(x, y) {
+        for cell in control_cells(&layout, self.active_tab) {
+            if !cell.rect.contains(x, y) {
                 continue;
             }
 
             if self.midi_learn.learning_target.load(Ordering::Relaxed) == MIDI_WAITING_FOR_CONTROL {
                 self.midi_learn
                     .learning_target
-                    .store(row.id.index() as i32, Ordering::Release);
+                    .store(cell.id.index() as i32, Ordering::Release);
                 invalidate(self.hwnd);
                 return;
             }
 
-            match row.id.spec().kind {
-                ValueKind::Boolean => self.toggle_control(row.id),
+            let before = snapshot_from_params(&self.params);
+            match cell.id.spec().kind {
+                ValueKind::Boolean => {
+                    self.push_undo_snapshot(before);
+                    self.toggle_control(cell.id);
+                }
                 ValueKind::Choice(labels) => {
-                    let next = if row.track.contains(x, y) {
-                        let unit = ((x - row.track.x) / row.track.w).clamp(0.0, 0.999_999);
+                    self.push_undo_snapshot(before);
+                    let next = if cell.segment_rect.contains(x, y) {
+                        let unit =
+                            ((x - cell.segment_rect.x) / cell.segment_rect.w).clamp(0.0, 0.999_999);
                         (unit * labels.len() as f32).floor() as f64
                     } else {
-                        let current = snapshot_from_params(&self.params).choice(row.id);
+                        let current = before.choice(cell.id);
                         ((current + 1) % labels.len().max(1)) as f64
                     };
-                    self.set_control_value(row.id, next);
+                    self.set_control_value(cell.id, next);
                 }
                 _ => {
+                    self.drag_snapshot = Some(before);
                     self.drag = Some(DragState {
-                        id: row.id,
-                        track: row.track,
+                        id: cell.id,
+                        start_x: x,
+                        start_y: y,
+                        start_unit: cell.id.spec().unit_from_value(before.get(cell.id)),
                     });
                     unsafe {
                         let _ = SetCapture(self.hwnd);
                     }
-                    self.set_from_x(row.id, row.track, x);
                 }
             }
             invalidate(self.hwnd);
@@ -983,17 +1132,20 @@ impl NativeWindowState {
         }
     }
 
-    fn mouse_move(&mut self, x: f32, _y: f32) {
+    fn mouse_move(&mut self, x: f32, y: f32) {
         if let Some(drag) = self.drag {
-            self.set_from_x(drag.id, drag.track, x);
+            self.set_from_drag(drag, x, y);
             invalidate(self.hwnd);
         }
     }
 
-    fn mouse_up(&mut self, x: f32, _y: f32) {
+    fn mouse_up(&mut self, x: f32, y: f32) {
         if let Some(drag) = self.drag.take() {
-            self.set_from_x(drag.id, drag.track, x);
+            self.set_from_drag(drag, x, y);
             let _ = unsafe { ReleaseCapture() };
+            if let Some(before) = self.drag_snapshot.take() {
+                self.record_undo_if_changed(before);
+            }
             invalidate(self.hwnd);
         }
     }
@@ -1015,15 +1167,119 @@ impl NativeWindowState {
         self.set_control_value(id, if current >= 0.5 { 0.0 } else { 1.0 });
     }
 
-    fn set_from_x(&self, id: ControlId, track: UiRect, x: f32) {
-        let unit = ((x - track.x) / track.w).clamp(0.0, 1.0) as f64;
-        let value = id.spec().value_from_unit(unit);
-        self.set_control_value(id, value);
+    fn set_from_drag(&self, drag: DragState, x: f32, y: f32) {
+        let delta = (drag.start_y - y) + (x - drag.start_x) * 0.28;
+        let sensitivity = match drag.id.spec().kind {
+            ValueKind::Hertz => 0.0035,
+            ValueKind::Milliseconds => 0.0035,
+            ValueKind::Decibel => 0.0045,
+            _ => 0.0055,
+        };
+        let unit = (drag.start_unit + delta as f64 * sensitivity).clamp(0.0, 1.0);
+        self.set_control_value(drag.id, drag.id.spec().value_from_unit(unit));
     }
 
     fn set_control_value(&self, id: ControlId, value: f64) {
         let setter = ParamSetter::new(self.context.as_ref());
         set_control(&self.params, &setter, id, value);
+    }
+
+    fn apply_snapshot(&self, snapshot: Snapshot) {
+        for id in ALL_CONTROLS {
+            self.set_control_value(id, snapshot.get(id));
+        }
+    }
+
+    fn push_undo_snapshot(&mut self, snapshot: Snapshot) {
+        if self.undo_stack.last().copied() != Some(snapshot) {
+            self.undo_stack.push(snapshot);
+            if self.undo_stack.len() > MAX_UNDO {
+                self.undo_stack.remove(0);
+            }
+            self.redo_stack.clear();
+        }
+    }
+
+    fn record_undo_if_changed(&mut self, before: Snapshot) {
+        if snapshot_from_params(&self.params) != before {
+            self.push_undo_snapshot(before);
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(snapshot) = self.undo_stack.pop() {
+            self.redo_stack.push(snapshot_from_params(&self.params));
+            self.redo_stack.truncate(MAX_UNDO);
+            self.apply_snapshot(snapshot);
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(snapshot) = self.redo_stack.pop() {
+            self.undo_stack.push(snapshot_from_params(&self.params));
+            self.undo_stack.truncate(MAX_UNDO);
+            self.apply_snapshot(snapshot);
+        }
+    }
+
+    fn save_preset(&mut self) {
+        let name = format!("Preset {}", self.preset_name_counter);
+        self.preset_name_counter += 1;
+        self.presets
+            .push((name, snapshot_from_params(&self.params)));
+        self.selected_preset = Some(self.presets.len() - 1);
+        self.preset_menu_open = false;
+    }
+
+    fn delete_selected_preset(&mut self) {
+        let Some(index) = self.selected_preset else {
+            return;
+        };
+        if index < self.presets.len() {
+            self.presets.remove(index);
+        }
+        self.selected_preset = if self.presets.is_empty() {
+            None
+        } else {
+            Some(index.min(self.presets.len() - 1))
+        };
+        self.preset_menu_open = false;
+    }
+
+    fn handle_preset_menu_click(&mut self, x: f32, y: f32, layout: &Layout) -> bool {
+        if !self.preset_menu_open {
+            return false;
+        }
+
+        let Some((menu, row_h)) = preset_menu_rect(layout, self.presets.len()) else {
+            self.preset_menu_open = false;
+            return true;
+        };
+
+        if !menu.contains(x, y) {
+            self.preset_menu_open = false;
+            return false;
+        }
+
+        if self.presets.is_empty() {
+            return true;
+        }
+
+        let row = ((y - menu.y - 5.0 * layout.s) / row_h).floor() as usize;
+        if let Some((_, snapshot)) = self.presets.get(row).cloned() {
+            let before = snapshot_from_params(&self.params);
+            self.push_undo_snapshot(before);
+            self.apply_snapshot(snapshot);
+            self.selected_preset = Some(row);
+            self.preset_menu_open = false;
+        }
+        true
+    }
+
+    fn clear_drag(&mut self) {
+        self.drag = None;
+        self.drag_snapshot = None;
+        let _ = unsafe { ReleaseCapture() };
     }
 
     fn ensure_render_target(&mut self) -> Option<ID2D1HwndRenderTarget> {
@@ -1077,7 +1333,9 @@ impl NativeWindowState {
 #[derive(Clone, Copy, Debug)]
 struct DragState {
     id: ControlId,
-    track: UiRect,
+    start_x: f32,
+    start_y: f32,
+    start_unit: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1135,7 +1393,7 @@ enum Accent {
 }
 
 impl Accent {
-    fn brush<'a>(self, brushes: &'a Brushes) -> &'a ID2D1SolidColorBrush {
+    fn brush(self, brushes: &Brushes) -> &ID2D1SolidColorBrush {
         match self {
             Self::Cyan => &brushes.cyan,
             Self::Magenta => &brushes.magenta,
@@ -1146,7 +1404,7 @@ impl Accent {
         }
     }
 
-    fn soft_brush<'a>(self, brushes: &'a Brushes) -> &'a ID2D1SolidColorBrush {
+    fn soft_brush(self, brushes: &Brushes) -> &ID2D1SolidColorBrush {
         match self {
             Self::Cyan => &brushes.cyan_soft,
             Self::Magenta => &brushes.magenta_soft,
@@ -1319,6 +1577,11 @@ struct Layout {
     reduction_meter: UiRect,
     tabs: UiRect,
     controls: UiRect,
+    save_button: UiRect,
+    preset_button: UiRect,
+    delete_button: UiRect,
+    undo_button: UiRect,
+    redo_button: UiRect,
     bypass_button: UiRect,
     midi_button: UiRect,
     toolbar_status: UiRect,
@@ -1327,15 +1590,18 @@ struct Layout {
 
 impl Layout {
     fn new(w: f32, h: f32, _scale_hint: f32) -> Self {
-        let s = (w / BASE_W).min(h / BASE_H).clamp(0.52, 1.7);
+        let s = (w / BASE_W).min(h / BASE_H).clamp(0.50, 1.4);
         let full = UiRect::new(0.0, 0.0, w, h);
-        let header = UiRect::new(0.0, 0.0, w, 64.0 * s);
-        let toolbar = UiRect::new(0.0, header.bottom(), w, 44.0 * s);
-        let margin = 14.0 * s;
-        let gap = 10.0 * s;
+        let header = UiRect::new(0.0, 0.0, w, 58.0 * s);
+        let toolbar = UiRect::new(0.0, header.bottom(), w, 42.0 * s);
+        let margin = 12.0 * s;
+        let gap = 9.0 * s;
         let meter_w = (164.0 * s).min(w * 0.22).max(120.0 * s);
         let analyzer_y = toolbar.bottom() + margin;
-        let analyzer_h = (h * 0.27).clamp(150.0 * s, 218.0 * s);
+        let content_available = (h - analyzer_y - margin).max(1.0);
+        let analyzer_h = (content_available * 0.34)
+            .clamp(118.0 * s, 185.0 * s)
+            .min(content_available * 0.48);
         let analyzer_w = (w - margin * 2.0 - meter_w - gap).max(260.0 * s);
         let analyzer = UiRect::new(margin, analyzer_y, analyzer_w, analyzer_h);
         let peak_meter = UiRect::new(
@@ -1350,25 +1616,48 @@ impl Layout {
             meter_w,
             (analyzer_h - gap) * 0.5,
         );
-        let tabs = UiRect::new(margin, analyzer.bottom() + gap, w - margin * 2.0, 40.0 * s);
+        let tabs = UiRect::new(margin, analyzer.bottom() + gap, w - margin * 2.0, 36.0 * s);
         let controls = UiRect::new(
             margin,
             tabs.bottom() + gap,
             w - margin * 2.0,
-            (h - tabs.bottom() - gap - margin).max(190.0 * s),
+            (h - tabs.bottom() - gap - margin).max(1.0),
         );
-        let bypass_button = UiRect::new(margin, toolbar.y + 8.0 * s, 110.0 * s, 28.0 * s);
+        let button_y = toolbar.y + 7.0 * s;
+        let button_h = 28.0 * s;
+        let save_button = UiRect::new(margin, button_y, 64.0 * s, button_h);
+        let preset_button =
+            UiRect::new(save_button.right() + 7.0 * s, button_y, 122.0 * s, button_h);
+        let delete_button = UiRect::new(
+            preset_button.right() + 7.0 * s,
+            button_y,
+            68.0 * s,
+            button_h,
+        );
+        let undo_button = UiRect::new(
+            delete_button.right() + 12.0 * s,
+            button_y,
+            64.0 * s,
+            button_h,
+        );
+        let redo_button = UiRect::new(undo_button.right() + 7.0 * s, button_y, 64.0 * s, button_h);
+        let bypass_button = UiRect::new(
+            redo_button.right() + 12.0 * s,
+            button_y,
+            104.0 * s,
+            button_h,
+        );
         let midi_button = UiRect::new(
             bypass_button.right() + 8.0 * s,
-            bypass_button.y,
+            button_y,
             132.0 * s,
-            28.0 * s,
+            button_h,
         );
         let toolbar_status = UiRect::new(
             midi_button.right() + 16.0 * s,
-            bypass_button.y,
-            320.0 * s,
-            28.0 * s,
+            button_y,
+            (w - midi_button.right() - 28.0 * s).max(90.0 * s),
+            button_h,
         );
         Self {
             full,
@@ -1379,6 +1668,11 @@ impl Layout {
             reduction_meter,
             tabs,
             controls,
+            save_button,
+            preset_button,
+            delete_button,
+            undo_button,
+            redo_button,
             bypass_button,
             midi_button,
             toolbar_status,
@@ -1406,6 +1700,10 @@ impl UiRect {
 
     fn bottom(self) -> f32 {
         self.y + self.h
+    }
+
+    fn center_x(self) -> f32 {
+        self.x + self.w * 0.5
     }
 
     fn center_y(self) -> f32 {
@@ -1440,28 +1738,36 @@ impl UiRect {
 }
 
 #[derive(Clone, Copy)]
-struct ControlRow {
+struct ControlCell {
     id: ControlId,
     rect: UiRect,
-    track: UiRect,
+    knob_rect: UiRect,
+    segment_rect: UiRect,
     value_rect: UiRect,
-    label_w: f32,
 }
 
-fn control_rows(layout: &Layout, tab: Tab) -> Vec<ControlRow> {
+fn control_cells(layout: &Layout, tab: Tab) -> Vec<ControlCell> {
     let controls = tab.controls();
     let s = layout.s;
     let inner = layout.controls.shrink(14.0 * s);
     let top = inner.y + 30.0 * s;
     let available_h = (inner.bottom() - top).max(1.0);
-    let columns = if inner.w >= 760.0 * s { 2 } else { 1 };
+    let columns = if inner.w >= 900.0 * s {
+        4
+    } else if inner.w >= 650.0 * s {
+        3
+    } else if inner.w >= 430.0 * s {
+        2
+    } else {
+        1
+    };
     let gap = 10.0 * s;
-    let rows_per_col = (controls.len() + columns - 1) / columns;
+    let rows_per_col = controls.len().div_ceil(columns);
     let row_h = ((available_h - gap * (rows_per_col.saturating_sub(1)) as f32)
         / rows_per_col.max(1) as f32)
-        .clamp(36.0 * s, 48.0 * s);
+        .clamp(68.0 * s, 86.0 * s);
     let col_w = (inner.w - gap * (columns.saturating_sub(1)) as f32) / columns as f32;
-    let mut rows = Vec::with_capacity(controls.len());
+    let mut cells = Vec::with_capacity(controls.len());
 
     for (index, id) in controls.iter().copied().enumerate() {
         let col = index / rows_per_col.max(1);
@@ -1472,30 +1778,54 @@ fn control_rows(layout: &Layout, tab: Tab) -> Vec<ControlRow> {
             col_w,
             row_h,
         );
-        let label_w = (rect.w * 0.32).clamp(112.0 * s, 170.0 * s);
-        let value_w = (rect.w * 0.25).clamp(88.0 * s, 138.0 * s);
-        let track = UiRect::new(
-            rect.x + label_w,
-            rect.y + rect.h * 0.5 - 8.0 * s,
-            (rect.w - label_w - value_w - 12.0 * s).max(60.0 * s),
-            16.0 * s,
+        let knob_size = (rect.h * 0.43).min(rect.w * 0.32).max(28.0 * s);
+        let knob_rect = UiRect::new(
+            rect.center_x() - knob_size * 0.5,
+            rect.y + 23.0 * s,
+            knob_size,
+            knob_size,
+        );
+        let segment_rect = UiRect::new(
+            rect.x + 9.0 * s,
+            rect.y + 33.0 * s,
+            rect.w - 18.0 * s,
+            24.0 * s,
         );
         let value_rect = UiRect::new(
-            rect.right() - value_w - 8.0 * s,
-            rect.y + 4.0 * s,
-            value_w,
-            rect.h - 8.0 * s,
+            rect.x + 9.0 * s,
+            rect.bottom() - 22.0 * s,
+            rect.w - 18.0 * s,
+            18.0 * s,
         );
-        rows.push(ControlRow {
+        cells.push(ControlCell {
             id,
             rect,
-            track,
+            knob_rect,
+            segment_rect,
             value_rect,
-            label_w,
         });
     }
 
-    rows
+    cells
+}
+
+fn preset_menu_rect(layout: &Layout, preset_count: usize) -> Option<(UiRect, f32)> {
+    if layout.preset_button.w <= 0.0 {
+        return None;
+    }
+
+    let s = layout.s;
+    let rows = preset_count.clamp(1, 8);
+    let row_h = 28.0 * s;
+    Some((
+        UiRect::new(
+            layout.preset_button.x,
+            layout.preset_button.bottom() + 4.0 * s,
+            (220.0 * s).max(layout.preset_button.w),
+            row_h * rows as f32 + 10.0 * s,
+        ),
+        row_h,
+    ))
 }
 
 fn tab_rects(layout: &Layout) -> Vec<(Tab, UiRect)> {
@@ -1631,6 +1961,79 @@ fn stroke_circle(
             Option::<&windows::Win32::Graphics::Direct2D::ID2D1StrokeStyle>::None,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_arc(
+    rt: &ID2D1HwndRenderTarget,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    start: f32,
+    end: f32,
+    brush: &ID2D1SolidColorBrush,
+    width: f32,
+) {
+    let steps = 30;
+    let span = end - start;
+    let mut prev = None;
+    for index in 0..=steps {
+        let angle = start + span * index as f32 / steps as f32;
+        let point = (cx + radius * angle.cos(), cy + radius * angle.sin());
+        if let Some((px, py)) = prev {
+            draw_line(rt, px, py, point.0, point.1, brush, width);
+        }
+        prev = Some(point);
+    }
+}
+
+fn draw_knob(
+    rt: &ID2D1HwndRenderTarget,
+    rect: UiRect,
+    unit: f32,
+    accent: Accent,
+    brushes: &Brushes,
+    s: f32,
+) {
+    let unit = unit.clamp(0.0, 1.0);
+    let radius = rect.w.min(rect.h) * 0.5;
+    let cx = rect.center_x();
+    let cy = rect.center_y();
+    let start = std::f32::consts::PI * 0.75;
+    let sweep = std::f32::consts::PI * 1.5;
+    let angle = start + sweep * unit;
+    let accent_brush = accent.brush(brushes);
+
+    fill_circle(rt, cx, cy + 1.5 * s, radius + 1.0 * s, &brushes.black);
+    fill_circle(rt, cx, cy, radius, &brushes.control);
+    stroke_circle(rt, cx, cy, radius, &brushes.border, 1.0);
+    draw_arc(
+        rt,
+        cx,
+        cy,
+        radius * 0.78,
+        start,
+        start + sweep,
+        &brushes.border,
+        3.0 * s,
+    );
+    if unit > 0.003 {
+        draw_arc(
+            rt,
+            cx,
+            cy,
+            radius * 0.78,
+            start,
+            angle,
+            accent_brush,
+            3.2 * s,
+        );
+    }
+
+    let dot_x = cx + radius * 0.48 * angle.cos();
+    let dot_y = cy + radius * 0.48 * angle.sin();
+    fill_circle(rt, dot_x, dot_y, 2.7 * s, accent_brush);
+    fill_circle(rt, dot_x, dot_y, 1.2 * s, &brushes.text_primary);
 }
 
 enum Align {
@@ -1793,6 +2196,10 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             WM_LBUTTONUP => {
                 let (x, y) = point_from_lparam(lparam);
                 state.mouse_up(x, y);
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED | WM_CANCELMODE => {
+                state.clear_drag();
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
