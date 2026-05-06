@@ -4,16 +4,21 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use nih_plug::prelude::*;
+#[cfg(not(target_os = "windows"))]
 use nih_plug_egui::{create_egui_editor, egui::Context, EguiState};
 use parking_lot::Mutex;
 
 pub mod analyzer;
 pub mod dsp;
+#[cfg(not(target_os = "windows"))]
 mod gui;
 pub mod model;
+#[cfg(target_os = "windows")]
+mod windows_editor;
 
 use analyzer::SpectrumAnalyzer;
 use dsp::{DspSettings, NebulaClusterDsp};
+#[cfg(not(target_os = "windows"))]
 use gui::{draw, GuiParams, MeterSnapshot, NebulaClusterGui};
 use model::{format_value, parse_value, ControlId, Snapshot, ValueKind, CONTROL_COUNT};
 
@@ -104,6 +109,7 @@ impl MidiLearnShared {
 
 #[derive(Params)]
 pub struct NebulaClusterParams {
+    #[cfg(not(target_os = "windows"))]
     #[persist = "editor-state"]
     pub editor_state: Arc<EguiState>,
 
@@ -192,6 +198,7 @@ pub struct NebulaClusterParams {
 impl Default for NebulaClusterParams {
     fn default() -> Self {
         Self {
+            #[cfg(not(target_os = "windows"))]
             editor_state: EguiState::from_size(1180, 760),
             input_level: make_param(ControlId::InputLevel),
             input_pan: make_param(ControlId::InputPan),
@@ -338,6 +345,7 @@ impl Plugin for NebulaCluster {
         self.params.clone()
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
         let meters = self.meters.clone();
@@ -367,6 +375,16 @@ impl Plugin for NebulaCluster {
                     set_control(&params, setter, change.id, change.value);
                 }
             },
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        windows_editor::create_editor(
+            self.params.clone(),
+            self.analyzer.shared(),
+            self.meters.clone(),
+            self.midi_learn.clone(),
         )
     }
 
@@ -517,6 +535,8 @@ impl Vst3Plugin for NebulaCluster {
 
 nih_export_clap!(NebulaCluster);
 nih_export_vst3!(NebulaCluster);
+#[cfg(target_os = "macos")]
+clap_wrapper::export_auv2!();
 
 fn process_oversampled(
     dsp: &mut NebulaClusterDsp,
