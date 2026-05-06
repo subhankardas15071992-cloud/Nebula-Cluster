@@ -31,19 +31,22 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, InvalidateRect, UpdateWindow, HBRUSH, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_ESCAPE, VK_RETURN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, KillTimer,
     LoadCursorW, RegisterClassW, SetTimer, SetWindowLongPtrW, ShowWindow, CREATESTRUCTW,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, IDC_ARROW, SW_SHOW, WINDOW_EX_STYLE,
-    WM_CANCELMODE, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_VISIBLE,
+    CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, DLGC_WANTALLKEYS, DLGC_WANTCHARS, GWLP_USERDATA, HMENU,
+    IDC_ARROW, SW_SHOW, WINDOW_EX_STYLE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CHAR, WM_ERASEBKGND,
+    WM_GETDLGCODE, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 use windows_numerics::Vector2;
 
 use super::analyzer::AnalyzerData;
-use super::model::{format_value, ControlId, Snapshot, ValueKind, ALL_CONTROLS};
+use super::model::{format_value, parse_value, ControlId, Snapshot, ValueKind, ALL_CONTROLS};
 use super::{
     apply_midi_cc_changes, set_control, snapshot_from_params, u32_to_f32, Meters, MidiLearnShared,
     NebulaClusterParams, MIDI_WAITING_FOR_CONTROL,
@@ -63,7 +66,6 @@ const GLOBAL_CONTROLS: &[ControlId] = &[
     ControlId::GlobalMix,
     ControlId::Oversampling,
     ControlId::GlobalPhase,
-    ControlId::FxBypass,
 ];
 const DISTORTION_CONTROLS: &[ControlId] = &[
     ControlId::DistortionEnabled,
@@ -141,8 +143,13 @@ impl Editor for NativeEditor {
         }
 
         let scale = f32::from_bits(self.scale_bits.load(Ordering::Acquire)).clamp(0.5, 3.0);
-        let width = BASE_W.round() as i32;
-        let height = BASE_H.round() as i32;
+        let parent_hwnd = HWND(parent_hwnd);
+        let scaled_width = (BASE_W * scale).round() as i32;
+        let scaled_height = (BASE_H * scale).round() as i32;
+        let (width, height) = client_size(parent_hwnd)
+            .filter(|(width, height)| *width > 100 && *height > 100)
+            .map(|(width, height)| (width as i32, height as i32))
+            .unwrap_or((scaled_width, scaled_height));
 
         let state = Box::new(NativeWindowState::new(
             self.params.clone(),
@@ -164,7 +171,7 @@ impl Editor for NativeEditor {
                 0,
                 width,
                 height,
-                Some(HWND(parent_hwnd)),
+                Some(parent_hwnd),
                 Option::<HMENU>::None,
                 module_instance(),
                 Some(state_ptr.cast::<c_void>()),
@@ -237,8 +244,17 @@ struct NativeWindowState {
     preset_name_counter: usize,
     selected_preset: Option<usize>,
     preset_menu_open: bool,
+    preset_name_input: Option<String>,
+    numeric_input: Option<NumericInput>,
+    choice_dropdown: Option<ChoiceDropdown>,
+    midi_context_menu_open: bool,
+    midi_cleanup_menu_open: bool,
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
+    state_a: Snapshot,
+    state_b: Snapshot,
+    active_state_is_a: bool,
+    chaos_seed: u64,
     scale: f32,
 }
 
@@ -269,8 +285,17 @@ impl NativeWindowState {
             preset_name_counter: 1,
             selected_preset: None,
             preset_menu_open: false,
+            preset_name_input: None,
+            numeric_input: None,
+            choice_dropdown: None,
+            midi_context_menu_open: false,
+            midi_cleanup_menu_open: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            state_a: Snapshot::default(),
+            state_b: Snapshot::default(),
+            active_state_is_a: true,
+            chaos_seed: 0x4e43_6c75_7374_6572,
             scale,
         }
     }
@@ -305,7 +330,12 @@ impl NativeWindowState {
         self.draw_meters(&rt, &brushes, &formats, &layout);
         self.draw_tabs(&rt, &brushes, &formats, &layout);
         self.draw_controls(&rt, &brushes, &formats, &layout, snapshot);
+        self.draw_choice_dropdown(&rt, &brushes, &formats, snapshot);
         self.draw_preset_menu(&rt, &brushes, &formats, &layout);
+        self.draw_midi_context_menu(&rt, &brushes, &formats, &layout);
+        self.draw_midi_cleanup_menu(&rt, &brushes, &formats, &layout);
+        self.draw_preset_name_popup(&rt, &brushes, &formats, &layout);
+        self.draw_numeric_popup(&rt, &brushes, &formats, &layout);
 
         if unsafe { rt.EndDraw(None, None) }.is_err() {
             self.render_target = None;
@@ -498,13 +528,37 @@ impl NativeWindowState {
             Accent::Purple,
         );
 
+        self.draw_button(
+            rt,
+            brushes,
+            formats,
+            layout.ab_button,
+            if self.active_state_is_a {
+                "A/B A"
+            } else {
+                "A/B B"
+            },
+            true,
+            Accent::Magenta,
+        );
+
+        self.draw_button(
+            rt,
+            brushes,
+            formats,
+            layout.chaos_button,
+            "Chaos",
+            false,
+            Accent::Amber,
+        );
+
         let bypass = snapshot.bool(ControlId::FxBypass);
         self.draw_button(
             rt,
             brushes,
             formats,
             layout.bypass_button,
-            if bypass { "Bypassed" } else { "Bypass" },
+            if bypass { "FX Bypassed" } else { "FX Bypass" },
             bypass,
             Accent::Red,
         );
@@ -602,6 +656,256 @@ impl NativeWindowState {
                 Align::Leading,
             );
         }
+    }
+
+    fn draw_choice_dropdown(
+        &self,
+        rt: &ID2D1HwndRenderTarget,
+        brushes: &Brushes,
+        formats: &TextFormats,
+        snapshot: Snapshot,
+    ) {
+        let Some(dropdown) = self.choice_dropdown else {
+            return;
+        };
+        let ValueKind::Choice(labels) = dropdown.id.spec().kind else {
+            return;
+        };
+        let menu = choice_dropdown_rect(dropdown.rect, labels.len());
+        let s = dropdown.rect.scale_hint();
+        fill_round(rt, menu, 5.0 * s, &brushes.panel_dark);
+        stroke_round(
+            rt,
+            menu,
+            5.0 * s,
+            self.active_tab.accent().brush(brushes),
+            1.0,
+        );
+
+        let row_h = dropdown.rect.h.max(20.0);
+        let selected = snapshot.choice(dropdown.id);
+        for (index, label) in labels.iter().enumerate() {
+            let row = UiRect::new(menu.x, menu.y + row_h * index as f32, menu.w, row_h);
+            if selected == index {
+                fill_round(rt, row.shrink(2.0 * s), 4.0 * s, &brushes.cyan_soft);
+            }
+            draw_text(
+                rt,
+                label,
+                row,
+                &formats.small,
+                if selected == index {
+                    self.active_tab.accent().brush(brushes)
+                } else {
+                    &brushes.text_secondary
+                },
+                Align::Center,
+            );
+        }
+    }
+
+    fn draw_preset_name_popup(
+        &self,
+        rt: &ID2D1HwndRenderTarget,
+        brushes: &Brushes,
+        formats: &TextFormats,
+        layout: &Layout,
+    ) {
+        let Some(name) = &self.preset_name_input else {
+            return;
+        };
+        let popup = preset_name_popup_layout(layout);
+        draw_modal_panel(rt, brushes, popup.rect, layout.s);
+        draw_text(
+            rt,
+            "Save Preset",
+            popup.title,
+            &formats.body_bold,
+            &brushes.text_primary,
+            Align::Leading,
+        );
+        fill_round(rt, popup.input, 4.0 * layout.s, &brushes.black);
+        stroke_round(rt, popup.input, 4.0 * layout.s, &brushes.cyan_dim, 1.0);
+        draw_text(
+            rt,
+            name,
+            popup.input.shrink(8.0 * layout.s),
+            &formats.small,
+            &brushes.text_primary,
+            Align::Leading,
+        );
+        self.draw_button(rt, brushes, formats, popup.ok, "Save", true, Accent::Cyan);
+        self.draw_button(
+            rt,
+            brushes,
+            formats,
+            popup.cancel,
+            "Cancel",
+            false,
+            Accent::Red,
+        );
+    }
+
+    fn draw_numeric_popup(
+        &self,
+        rt: &ID2D1HwndRenderTarget,
+        brushes: &Brushes,
+        formats: &TextFormats,
+        layout: &Layout,
+    ) {
+        let Some(input) = &self.numeric_input else {
+            return;
+        };
+        let popup = numeric_popup_layout(layout);
+        draw_modal_panel(rt, brushes, popup.rect, layout.s);
+        draw_text(
+            rt,
+            input.id.spec().name,
+            popup.title,
+            &formats.body_bold,
+            &brushes.text_primary,
+            Align::Leading,
+        );
+        fill_round(rt, popup.input, 4.0 * layout.s, &brushes.black);
+        stroke_round(rt, popup.input, 4.0 * layout.s, &brushes.cyan_dim, 1.0);
+        draw_text(
+            rt,
+            &input.value,
+            popup.input.shrink(8.0 * layout.s),
+            &formats.small,
+            &brushes.text_primary,
+            Align::Leading,
+        );
+        self.draw_button(rt, brushes, formats, popup.ok, "Apply", true, Accent::Cyan);
+        self.draw_button(
+            rt,
+            brushes,
+            formats,
+            popup.cancel,
+            "Cancel",
+            false,
+            Accent::Red,
+        );
+    }
+
+    fn draw_midi_context_menu(
+        &self,
+        rt: &ID2D1HwndRenderTarget,
+        brushes: &Brushes,
+        formats: &TextFormats,
+        layout: &Layout,
+    ) {
+        if !self.midi_context_menu_open {
+            return;
+        }
+        let menu = midi_context_rect(layout);
+        fill_round(rt, menu, 6.0 * layout.s, &brushes.panel_dark);
+        stroke_round(rt, menu, 6.0 * layout.s, &brushes.green, 1.0);
+        let enabled = self.midi_learn.midi_enabled.load(Ordering::Relaxed);
+        let labels = [
+            if enabled { "MIDI Off" } else { "MIDI On" },
+            "Clean Up >",
+            "Roll Back",
+            "Save",
+        ];
+        for (index, label) in labels.iter().enumerate() {
+            let row = midi_context_row(layout, index);
+            let active = index == 1 && self.midi_cleanup_menu_open;
+            if active {
+                fill_round(
+                    rt,
+                    row.shrink(2.0 * layout.s),
+                    4.0 * layout.s,
+                    &brushes.green_soft,
+                );
+            }
+            draw_text(
+                rt,
+                label,
+                UiRect::new(
+                    row.x + 9.0 * layout.s,
+                    row.y,
+                    row.w - 18.0 * layout.s,
+                    row.h,
+                ),
+                &formats.small,
+                if active {
+                    &brushes.green
+                } else {
+                    &brushes.text_secondary
+                },
+                Align::Leading,
+            );
+        }
+    }
+
+    fn draw_midi_cleanup_menu(
+        &self,
+        rt: &ID2D1HwndRenderTarget,
+        brushes: &Brushes,
+        formats: &TextFormats,
+        layout: &Layout,
+    ) {
+        if !self.midi_context_menu_open || !self.midi_cleanup_menu_open {
+            return;
+        }
+
+        self.midi_learn.sync_mutex_from_atomic_if_needed();
+        let mappings = self.midi_learn.mappings.lock().clone();
+        let mut sorted: Vec<(u8, u8)> = mappings.iter().map(|(&cc, &param)| (cc, param)).collect();
+        sorted.sort_by_key(|(cc, _)| *cc);
+
+        let menu = midi_cleanup_rect(layout, sorted.len());
+        fill_round(rt, menu, 6.0 * layout.s, &brushes.panel_dark);
+        stroke_round(rt, menu, 6.0 * layout.s, &brushes.green, 1.0);
+
+        if sorted.is_empty() {
+            draw_text(
+                rt,
+                "No MIDI mappings",
+                menu.shrink(7.0 * layout.s),
+                &formats.small,
+                &brushes.text_dim,
+                Align::Center,
+            );
+            return;
+        }
+
+        for (index, (cc, param_index)) in sorted.iter().take(8).enumerate() {
+            let row = midi_cleanup_row(layout, index);
+            let name = ControlId::from_index(*param_index as usize)
+                .map(|id| id.spec().name)
+                .unwrap_or("Unknown");
+            draw_text(
+                rt,
+                &format!("CC {cc}: {name}"),
+                UiRect::new(
+                    row.x + 8.0 * layout.s,
+                    row.y,
+                    row.w - 16.0 * layout.s,
+                    row.h,
+                ),
+                &formats.tiny,
+                &brushes.text_secondary,
+                Align::Leading,
+            );
+        }
+
+        let clear = midi_cleanup_row(layout, sorted.len().min(8));
+        fill_round(
+            rt,
+            clear.shrink(2.0 * layout.s),
+            4.0 * layout.s,
+            &brushes.red_soft,
+        );
+        draw_text(
+            rt,
+            "Clear All",
+            clear,
+            &formats.small,
+            &brushes.red,
+            Align::Center,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -747,9 +1051,9 @@ impl NativeWindowState {
             brushes,
             formats,
             layout.peak_meter,
-            "Peak",
+            "Output Peak",
             peak,
-            ((peak + 60.0) / 60.0).clamp(0.0, 1.0),
+            ((peak + 60.0) / 72.0).clamp(0.0, 1.0),
             Accent::Green,
         );
         self.draw_meter(
@@ -757,9 +1061,9 @@ impl NativeWindowState {
             brushes,
             formats,
             layout.reduction_meter,
-            "Reduction",
-            gain_reduction,
-            (-gain_reduction / 36.0).clamp(0.0, 1.0),
+            "Gain Reduction",
+            -gain_reduction.abs(),
+            ((-gain_reduction.abs() + 24.0) / 24.0).clamp(0.0, 1.0),
             Accent::Amber,
         );
     }
@@ -776,37 +1080,46 @@ impl NativeWindowState {
         norm: f32,
         accent: Accent,
     ) {
-        card(rt, rect, 8.0 * rect.scale_hint(), brushes);
         let s = rect.scale_hint();
-        let inner = rect.shrink(9.0 * s);
+        card(rt, rect, 8.0 * s, brushes);
+        let inner = rect.shrink(7.0 * s);
+        let label_w = (98.0 * s).min(inner.w * 0.46).max(70.0 * s);
+        let label_rect = UiRect::new(inner.x, inner.y, label_w, inner.h);
+        let bar = UiRect::new(
+            inner.x + label_w,
+            inner.y + 8.0 * s,
+            (inner.w - label_w).max(24.0 * s),
+            (inner.h - 16.0 * s).max(10.0 * s),
+        );
+        let fill = UiRect::new(bar.x, bar.y, bar.w * norm.clamp(0.0, 1.0), bar.h);
+
         draw_text(
             rt,
             label,
-            UiRect::new(inner.x, inner.y, inner.w, 16.0 * s),
-            &formats.small,
+            label_rect,
+            &formats.tiny,
             &brushes.text_dim,
             Align::Leading,
         );
+        fill_round(rt, bar, 4.0 * s, &brushes.black);
+        fill_round(rt, fill, 4.0 * s, accent.soft_brush(brushes));
+        stroke_round(rt, bar, 4.0 * s, accent.brush(brushes), 1.0);
+        let value_w = (74.0 * s).min((bar.w - 6.0 * s).max(1.0));
         let value_rect = UiRect::new(
-            inner.x,
-            inner.y + 19.0 * s,
-            inner.w,
-            (inner.h - 35.0 * s).max(20.0 * s),
+            bar.right() - value_w - 3.0 * s,
+            bar.y + 3.0 * s,
+            value_w,
+            (bar.h - 6.0 * s).max(8.0 * s),
         );
-        fill_round(rt, value_rect, 4.0 * s, &brushes.black);
-        stroke_round(rt, value_rect, 4.0 * s, &brushes.border, 1.0);
+        fill_round(rt, value_rect, 3.0 * s, &brushes.panel_dark);
         draw_text(
             rt,
-            &format!("{value_db:.1} dB"),
-            value_rect,
-            &formats.body_bold,
-            accent.brush(brushes),
-            Align::Center,
+            &format_db(value_db),
+            value_rect.shrink(4.0 * s),
+            &formats.tiny,
+            &brushes.text_primary,
+            Align::Trailing,
         );
-        let track = UiRect::new(inner.x, rect.bottom() - 20.0 * s, inner.w, 8.0 * s);
-        fill_round(rt, track, 4.0 * s, &brushes.control);
-        let fill = UiRect::new(track.x, track.y, track.w * norm.clamp(0.0, 1.0), track.h);
-        fill_round(rt, fill, 4.0 * s, accent.brush(brushes));
     }
 
     fn draw_tabs(
@@ -1034,12 +1347,24 @@ impl NativeWindowState {
         };
         let layout = Layout::new(size.0 as f32, size.1 as f32, self.scale);
 
+        if self.handle_modal_click(x, y, &layout) {
+            invalidate(self.hwnd);
+            return;
+        }
+        if self.handle_choice_dropdown_click(x, y) {
+            invalidate(self.hwnd);
+            return;
+        }
+        if self.handle_midi_menu_click(x, y, &layout) {
+            invalidate(self.hwnd);
+            return;
+        }
         if self.handle_preset_menu_click(x, y, &layout) {
             invalidate(self.hwnd);
             return;
         }
         if layout.save_button.contains(x, y) {
-            self.save_preset();
+            self.open_preset_save();
             invalidate(self.hwnd);
             return;
         }
@@ -1060,6 +1385,16 @@ impl NativeWindowState {
         }
         if layout.redo_button.contains(x, y) {
             self.redo();
+            invalidate(self.hwnd);
+            return;
+        }
+        if layout.ab_button.contains(x, y) {
+            self.toggle_ab();
+            invalidate(self.hwnd);
+            return;
+        }
+        if layout.chaos_button.contains(x, y) {
+            self.apply_chaos();
             invalidate(self.hwnd);
             return;
         }
@@ -1097,22 +1432,23 @@ impl NativeWindowState {
             }
 
             let before = snapshot_from_params(&self.params);
+            if cell.value_rect.contains(x, y) {
+                self.open_numeric_input(cell.id, before);
+                invalidate(self.hwnd);
+                return;
+            }
+
             match cell.id.spec().kind {
                 ValueKind::Boolean => {
                     self.push_undo_snapshot(before);
                     self.toggle_control(cell.id);
                 }
                 ValueKind::Choice(labels) => {
-                    self.push_undo_snapshot(before);
-                    let next = if cell.segment_rect.contains(x, y) {
-                        let unit =
-                            ((x - cell.segment_rect.x) / cell.segment_rect.w).clamp(0.0, 0.999_999);
-                        (unit * labels.len() as f32).floor() as f64
-                    } else {
-                        let current = before.choice(cell.id);
-                        ((current + 1) % labels.len().max(1)) as f64
-                    };
-                    self.set_control_value(cell.id, next);
+                    let _ = labels;
+                    self.choice_dropdown = Some(ChoiceDropdown {
+                        id: cell.id,
+                        rect: cell.segment_rect,
+                    });
                 }
                 _ => {
                     self.drag_snapshot = Some(before);
@@ -1147,6 +1483,37 @@ impl NativeWindowState {
                 self.record_undo_if_changed(before);
             }
             invalidate(self.hwnd);
+        }
+    }
+
+    fn mouse_right_down(&mut self, x: f32, y: f32) {
+        let _ = unsafe { SetFocus(Some(self.hwnd)) };
+        let Some(size) = client_size(self.hwnd) else {
+            return;
+        };
+        let layout = Layout::new(size.0 as f32, size.1 as f32, self.scale);
+        if layout.midi_button.contains(x, y) {
+            self.midi_context_menu_open = !self.midi_context_menu_open;
+            self.midi_cleanup_menu_open = false;
+            self.preset_menu_open = false;
+            self.choice_dropdown = None;
+            invalidate(self.hwnd);
+        }
+    }
+
+    fn mouse_double_click(&mut self, x: f32, y: f32) {
+        let Some(size) = client_size(self.hwnd) else {
+            return;
+        };
+        let layout = Layout::new(size.0 as f32, size.1 as f32, self.scale);
+        for cell in control_cells(&layout, self.active_tab) {
+            if cell.rect.contains(x, y) {
+                let before = snapshot_from_params(&self.params);
+                self.push_undo_snapshot(before);
+                self.set_control_value(cell.id, cell.id.spec().default);
+                invalidate(self.hwnd);
+                return;
+            }
         }
     }
 
@@ -1222,13 +1589,41 @@ impl NativeWindowState {
         }
     }
 
-    fn save_preset(&mut self) {
-        let name = format!("Preset {}", self.preset_name_counter);
+    fn open_preset_save(&mut self) {
+        self.preset_name_input = Some(format!("Preset {}", self.preset_name_counter));
+        self.preset_menu_open = false;
+        self.choice_dropdown = None;
+        let _ = unsafe { SetFocus(Some(self.hwnd)) };
+    }
+
+    fn save_preset(&mut self, name: String) {
+        let name = default_preset_name(name.trim(), &self.presets);
         self.preset_name_counter += 1;
         self.presets
             .push((name, snapshot_from_params(&self.params)));
         self.selected_preset = Some(self.presets.len() - 1);
         self.preset_menu_open = false;
+        self.preset_name_input = None;
+    }
+
+    fn open_numeric_input(&mut self, id: ControlId, snapshot: Snapshot) {
+        self.numeric_input = Some(NumericInput {
+            id,
+            value: format_value(id, snapshot.get(id)),
+        });
+        self.choice_dropdown = None;
+        let _ = unsafe { SetFocus(Some(self.hwnd)) };
+    }
+
+    fn confirm_numeric_input(&mut self) {
+        let Some(input) = self.numeric_input.take() else {
+            return;
+        };
+        if let Some(value) = parse_value(input.id, &input.value) {
+            let before = snapshot_from_params(&self.params);
+            self.push_undo_snapshot(before);
+            self.set_control_value(input.id, value);
+        }
     }
 
     fn delete_selected_preset(&mut self) {
@@ -1276,10 +1671,193 @@ impl NativeWindowState {
         true
     }
 
+    fn handle_modal_click(&mut self, x: f32, y: f32, layout: &Layout) -> bool {
+        if self.preset_name_input.is_some() {
+            let popup = preset_name_popup_layout(layout);
+            if popup.ok.contains(x, y) {
+                if let Some(name) = self.preset_name_input.take() {
+                    self.save_preset(name);
+                }
+                return true;
+            }
+            if popup.cancel.contains(x, y) || !popup.rect.contains(x, y) {
+                self.preset_name_input = None;
+                return true;
+            }
+            return true;
+        }
+
+        if self.numeric_input.is_some() {
+            let popup = numeric_popup_layout(layout);
+            if popup.ok.contains(x, y) {
+                self.confirm_numeric_input();
+                return true;
+            }
+            if popup.cancel.contains(x, y) || !popup.rect.contains(x, y) {
+                self.numeric_input = None;
+                return true;
+            }
+            return true;
+        }
+
+        false
+    }
+
+    fn handle_choice_dropdown_click(&mut self, x: f32, y: f32) -> bool {
+        let Some(dropdown) = self.choice_dropdown else {
+            return false;
+        };
+        let ValueKind::Choice(labels) = dropdown.id.spec().kind else {
+            self.choice_dropdown = None;
+            return false;
+        };
+        let menu = choice_dropdown_rect(dropdown.rect, labels.len());
+        if !menu.contains(x, y) {
+            self.choice_dropdown = None;
+            return false;
+        }
+
+        let row_h = dropdown.rect.h.max(20.0);
+        let index = ((y - menu.y) / row_h)
+            .floor()
+            .clamp(0.0, labels.len().saturating_sub(1) as f32) as usize;
+        let before = snapshot_from_params(&self.params);
+        self.push_undo_snapshot(before);
+        self.set_control_value(dropdown.id, index as f64);
+        self.choice_dropdown = None;
+        true
+    }
+
+    fn handle_midi_menu_click(&mut self, x: f32, y: f32, layout: &Layout) -> bool {
+        if self.midi_cleanup_menu_open {
+            self.midi_learn.sync_mutex_from_atomic_if_needed();
+            let mappings = self.midi_learn.mappings.lock().clone();
+            let mut sorted: Vec<(u8, u8)> =
+                mappings.iter().map(|(&cc, &param)| (cc, param)).collect();
+            sorted.sort_by_key(|(cc, _)| *cc);
+            if let Some(action) = midi_cleanup_hit(layout, x, y, &sorted) {
+                match action {
+                    CleanupAction::Remove(cc) => {
+                        self.midi_learn.mappings.lock().remove(&cc);
+                        self.midi_learn.sync_atomic_from_mutex();
+                    }
+                    CleanupAction::ClearAll => {
+                        self.midi_learn.mappings.lock().clear();
+                        self.midi_learn.sync_atomic_from_mutex();
+                        self.midi_learn.learning_target.store(-1, Ordering::Release);
+                    }
+                }
+                return true;
+            }
+        }
+
+        if !self.midi_context_menu_open {
+            return false;
+        }
+
+        let Some(action) = midi_context_hit(layout, x, y) else {
+            self.midi_context_menu_open = false;
+            self.midi_cleanup_menu_open = false;
+            return false;
+        };
+
+        match action {
+            MidiMenuAction::ToggleMidi => {
+                let enabled = self.midi_learn.midi_enabled.load(Ordering::Relaxed);
+                self.midi_learn
+                    .midi_enabled
+                    .store(!enabled, Ordering::Release);
+                self.midi_context_menu_open = false;
+                self.midi_cleanup_menu_open = false;
+            }
+            MidiMenuAction::CleanUp => {
+                self.midi_cleanup_menu_open = !self.midi_cleanup_menu_open;
+            }
+            MidiMenuAction::RollBack => {
+                let saved = self.midi_learn.saved_mappings.lock().clone();
+                *self.midi_learn.mappings.lock() = saved;
+                self.midi_learn.sync_atomic_from_mutex();
+                self.midi_learn.learning_target.store(-1, Ordering::Release);
+                self.midi_context_menu_open = false;
+                self.midi_cleanup_menu_open = false;
+            }
+            MidiMenuAction::Save => {
+                self.midi_learn.save_current_mapping();
+                self.midi_context_menu_open = false;
+                self.midi_cleanup_menu_open = false;
+            }
+        }
+        true
+    }
+
+    fn toggle_ab(&mut self) {
+        let before = snapshot_from_params(&self.params);
+        if self.active_state_is_a {
+            self.state_a = before;
+            self.active_state_is_a = false;
+            self.push_undo_snapshot(before);
+            self.apply_snapshot(self.state_b);
+        } else {
+            self.state_b = before;
+            self.active_state_is_a = true;
+            self.push_undo_snapshot(before);
+            self.apply_snapshot(self.state_a);
+        }
+    }
+
+    fn apply_chaos(&mut self) {
+        let before = snapshot_from_params(&self.params);
+        self.push_undo_snapshot(before);
+        let chaos = chaos_snapshot(&mut self.chaos_seed);
+        self.apply_snapshot(chaos);
+    }
+
     fn clear_drag(&mut self) {
         self.drag = None;
         self.drag_snapshot = None;
-        let _ = unsafe { ReleaseCapture() };
+    }
+
+    fn char_input(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        if let Some(name) = &mut self.preset_name_input {
+            if name.len() < 48 {
+                name.push(ch);
+            }
+        } else if let Some(input) = &mut self.numeric_input {
+            if input.value.len() < 48 {
+                input.value.push(ch);
+            }
+        }
+    }
+
+    fn key_down(&mut self, key: u32) {
+        if key == VK_ESCAPE.0 as u32 {
+            self.preset_name_input = None;
+            self.numeric_input = None;
+            self.choice_dropdown = None;
+            self.midi_context_menu_open = false;
+            self.midi_cleanup_menu_open = false;
+            return;
+        }
+
+        if key == VK_RETURN.0 as u32 {
+            if let Some(name) = self.preset_name_input.take() {
+                self.save_preset(name);
+            } else if self.numeric_input.is_some() {
+                self.confirm_numeric_input();
+            }
+            return;
+        }
+
+        if key == VK_BACK.0 as u32 {
+            if let Some(name) = &mut self.preset_name_input {
+                name.pop();
+            } else if let Some(input) = &mut self.numeric_input {
+                input.value.pop();
+            }
+        }
     }
 
     fn ensure_render_target(&mut self) -> Option<ID2D1HwndRenderTarget> {
@@ -1336,6 +1914,18 @@ struct DragState {
     start_x: f32,
     start_y: f32,
     start_unit: f64,
+}
+
+#[derive(Clone, Debug)]
+struct NumericInput {
+    id: ControlId,
+    value: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChoiceDropdown {
+    id: ControlId,
+    rect: UiRect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1582,6 +2172,8 @@ struct Layout {
     delete_button: UiRect,
     undo_button: UiRect,
     redo_button: UiRect,
+    ab_button: UiRect,
+    chaos_button: UiRect,
     bypass_button: UiRect,
     midi_button: UiRect,
     toolbar_status: UiRect,
@@ -1641,8 +2233,10 @@ impl Layout {
             button_h,
         );
         let redo_button = UiRect::new(undo_button.right() + 7.0 * s, button_y, 64.0 * s, button_h);
+        let ab_button = UiRect::new(redo_button.right() + 7.0 * s, button_y, 66.0 * s, button_h);
+        let chaos_button = UiRect::new(ab_button.right() + 7.0 * s, button_y, 70.0 * s, button_h);
         let bypass_button = UiRect::new(
-            redo_button.right() + 12.0 * s,
+            chaos_button.right() + 12.0 * s,
             button_y,
             104.0 * s,
             button_h,
@@ -1673,6 +2267,8 @@ impl Layout {
             delete_button,
             undo_button,
             redo_button,
+            ab_button,
+            chaos_button,
             bypass_button,
             midi_button,
             toolbar_status,
@@ -1826,6 +2422,234 @@ fn preset_menu_rect(layout: &Layout, preset_count: usize) -> Option<(UiRect, f32
         ),
         row_h,
     ))
+}
+
+fn draw_modal_panel(rt: &ID2D1HwndRenderTarget, brushes: &Brushes, rect: UiRect, scale: f32) {
+    fill_round(rt, rect, 8.0 * scale, &brushes.panel_dark);
+    stroke_round(rt, rect, 8.0 * scale, &brushes.cyan_dim, 1.0);
+}
+
+fn default_preset_name(input: &str, presets: &[(String, Snapshot)]) -> String {
+    let base = if input.trim().is_empty() {
+        format!("Preset {}", presets.len() + 1)
+    } else {
+        input.trim().to_string()
+    };
+
+    if !presets
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(&base))
+    {
+        return base;
+    }
+
+    for suffix in 2.. {
+        let candidate = format!("{base} {suffix}");
+        if !presets
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(&candidate))
+        {
+            return candidate;
+        }
+    }
+
+    base
+}
+
+fn chaos_snapshot(seed: &mut u64) -> Snapshot {
+    let mut snapshot = Snapshot::default();
+    for id in ALL_CONTROLS {
+        let spec = id.spec();
+        let value = match spec.kind {
+            ValueKind::Boolean => {
+                if rand_unit(seed) > 0.42 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            ValueKind::Choice(labels) => (rand_unit(seed) * labels.len() as f64)
+                .floor()
+                .min(labels.len().saturating_sub(1) as f64),
+            ValueKind::Decibel if matches!(id, ControlId::InputLevel | ControlId::OutputLevel) => {
+                -12.0 + rand_unit(seed) * 18.0
+            }
+            _ => spec.value_from_unit(rand_unit(seed)),
+        };
+        snapshot.set(id, value);
+    }
+    snapshot.set(ControlId::FxBypass, 0.0);
+    snapshot
+}
+
+fn rand_unit(seed: &mut u64) -> f64 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    ((*seed >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64))
+}
+
+fn format_db(value: f32) -> String {
+    if value <= -119.0 {
+        String::from("-inf dB")
+    } else {
+        format!("{value:.1} dB")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ModalLayout {
+    rect: UiRect,
+    title: UiRect,
+    input: UiRect,
+    ok: UiRect,
+    cancel: UiRect,
+}
+
+fn preset_name_popup_layout(layout: &Layout) -> ModalLayout {
+    modal_layout(layout, 360.0 * layout.s, 150.0 * layout.s)
+}
+
+fn numeric_popup_layout(layout: &Layout) -> ModalLayout {
+    modal_layout(layout, 330.0 * layout.s, 150.0 * layout.s)
+}
+
+fn modal_layout(layout: &Layout, width: f32, height: f32) -> ModalLayout {
+    let s = layout.s;
+    let rect = UiRect::new(
+        layout.full.center_x() - width * 0.5,
+        layout.full.center_y() - height * 0.5,
+        width,
+        height,
+    );
+    ModalLayout {
+        rect,
+        title: UiRect::new(
+            rect.x + 16.0 * s,
+            rect.y + 12.0 * s,
+            rect.w - 32.0 * s,
+            24.0 * s,
+        ),
+        input: UiRect::new(
+            rect.x + 16.0 * s,
+            rect.y + 46.0 * s,
+            rect.w - 32.0 * s,
+            34.0 * s,
+        ),
+        ok: UiRect::new(
+            rect.right() - 168.0 * s,
+            rect.bottom() - 46.0 * s,
+            72.0 * s,
+            28.0 * s,
+        ),
+        cancel: UiRect::new(
+            rect.right() - 88.0 * s,
+            rect.bottom() - 46.0 * s,
+            72.0 * s,
+            28.0 * s,
+        ),
+    }
+}
+
+fn choice_dropdown_rect(anchor: UiRect, label_count: usize) -> UiRect {
+    let row_h = anchor.h.max(20.0);
+    UiRect::new(
+        anchor.x,
+        anchor.bottom() + 2.0,
+        anchor.w,
+        row_h * label_count.max(1) as f32,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum MidiMenuAction {
+    ToggleMidi,
+    CleanUp,
+    RollBack,
+    Save,
+}
+
+#[derive(Clone, Copy)]
+enum CleanupAction {
+    Remove(u8),
+    ClearAll,
+}
+
+fn midi_context_rect(layout: &Layout) -> UiRect {
+    UiRect::new(
+        layout.midi_button.x,
+        layout.midi_button.bottom() + 4.0 * layout.s,
+        132.0 * layout.s,
+        116.0 * layout.s,
+    )
+}
+
+fn midi_context_row(layout: &Layout, index: usize) -> UiRect {
+    let menu = midi_context_rect(layout);
+    UiRect::new(
+        menu.x + 4.0 * layout.s,
+        menu.y + 4.0 * layout.s + index as f32 * 27.0 * layout.s,
+        menu.w - 8.0 * layout.s,
+        26.0 * layout.s,
+    )
+}
+
+fn midi_context_hit(layout: &Layout, x: f32, y: f32) -> Option<MidiMenuAction> {
+    let menu = midi_context_rect(layout);
+    if !menu.contains(x, y) {
+        return None;
+    }
+    for index in 0..4 {
+        if midi_context_row(layout, index).contains(x, y) {
+            return Some(match index {
+                0 => MidiMenuAction::ToggleMidi,
+                1 => MidiMenuAction::CleanUp,
+                2 => MidiMenuAction::RollBack,
+                _ => MidiMenuAction::Save,
+            });
+        }
+    }
+    None
+}
+
+fn midi_cleanup_rect(layout: &Layout, mapping_count: usize) -> UiRect {
+    let context = midi_context_rect(layout);
+    let rows = mapping_count.min(8) + 1;
+    UiRect::new(
+        context.right() + 5.0 * layout.s,
+        context.y + 27.0 * layout.s,
+        230.0 * layout.s,
+        8.0 * layout.s + rows as f32 * 26.0 * layout.s,
+    )
+}
+
+fn midi_cleanup_row(layout: &Layout, index: usize) -> UiRect {
+    let rect = midi_cleanup_rect(layout, 8);
+    UiRect::new(
+        rect.x + 4.0 * layout.s,
+        rect.y + 4.0 * layout.s + index as f32 * 26.0 * layout.s,
+        rect.w - 8.0 * layout.s,
+        25.0 * layout.s,
+    )
+}
+
+fn midi_cleanup_hit(
+    layout: &Layout,
+    x: f32,
+    y: f32,
+    mappings: &[(u8, u8)],
+) -> Option<CleanupAction> {
+    let visible_count = mappings.len().min(8);
+    let rect = midi_cleanup_rect(layout, mappings.len());
+    if !rect.contains(x, y) {
+        return None;
+    }
+    let mut row = ((y - rect.y - 4.0 * layout.s) / (26.0 * layout.s)).floor() as usize;
+    row = row.min(visible_count);
+    if row == visible_count {
+        return Some(CleanupAction::ClearAll);
+    }
+    mappings.get(row).map(|(cc, _)| CleanupAction::Remove(*cc))
 }
 
 fn tab_rects(layout: &Layout) -> Vec<(Tab, UiRect)> {
@@ -2108,7 +2932,7 @@ fn register_window_class() -> bool {
         };
         let cursor = unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() };
         let wc = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(window_proc),
             cbClsExtra: 0,
             cbWndExtra: 0,
@@ -2162,6 +2986,13 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 
         match msg {
             WM_ERASEBKGND => LRESULT(1),
+            WM_GETDLGCODE => {
+                if state.preset_name_input.is_some() || state.numeric_input.is_some() {
+                    LRESULT((DLGC_WANTALLKEYS | DLGC_WANTCHARS) as isize)
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
+            }
             WM_SIZE => {
                 state.render_target = None;
                 state.text_formats = None;
@@ -2184,6 +3015,16 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 state.mouse_down(x, y);
                 LRESULT(0)
             }
+            WM_LBUTTONDBLCLK => {
+                let (x, y) = point_from_lparam(lparam);
+                state.mouse_double_click(x, y);
+                LRESULT(0)
+            }
+            WM_RBUTTONDOWN => {
+                let (x, y) = point_from_lparam(lparam);
+                state.mouse_right_down(x, y);
+                LRESULT(0)
+            }
             WM_MOUSEMOVE => {
                 if state.drag.is_some() {
                     let (x, y) = point_from_lparam(lparam);
@@ -2197,6 +3038,32 @@ extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 let (x, y) = point_from_lparam(lparam);
                 state.mouse_up(x, y);
                 LRESULT(0)
+            }
+            WM_CHAR => {
+                if state.preset_name_input.is_some() || state.numeric_input.is_some() {
+                    if let Some(ch) = char::from_u32(wparam.0 as u32) {
+                        state.char_input(ch);
+                        invalidate(hwnd);
+                    }
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
+            }
+            WM_KEYDOWN => {
+                let wants_key = state.preset_name_input.is_some()
+                    || state.numeric_input.is_some()
+                    || state.choice_dropdown.is_some()
+                    || state.preset_menu_open
+                    || state.midi_context_menu_open
+                    || state.midi_cleanup_menu_open;
+                if wants_key {
+                    state.key_down(wparam.0 as u32);
+                    invalidate(hwnd);
+                    LRESULT(0)
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
             }
             WM_CAPTURECHANGED | WM_CANCELMODE => {
                 state.clear_drag();
