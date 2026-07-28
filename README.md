@@ -1,6 +1,6 @@
 # Nebula Cluster
 
-**Nebula Cluster** is a free open-source dirt box plugin made by **Nebula Audio**.
+**Nebula Cluster** is an open-source dirt box plugin made by **Nebula Audio**.
 
 It is built for one job: take clean, polite audio and give it weight, bite, heat, movement, and attitude. Put it on drums, bass, synths, vocals, guitars, loops, rooms, buses, or anything that needs to stop behaving.
 
