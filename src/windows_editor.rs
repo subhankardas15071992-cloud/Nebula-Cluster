@@ -52,8 +52,10 @@ use super::{
     NebulaClusterParams, MIDI_WAITING_FOR_CONTROL,
 };
 
-const BASE_W: f32 = 980.0;
-const BASE_H: f32 = 640.0;
+// Keep the native editor's canvas in lockstep with the Egui editor. This is a
+// deliberately roomy audio-plugin layout rather than a compact Win32 dialog.
+const BASE_W: f32 = 1180.0;
+const BASE_H: f32 = 760.0;
 const TIMER_ID: usize = 9107;
 const TIMER_MS: u32 = 50;
 const MAX_UNDO: usize = 64;
@@ -350,13 +352,39 @@ impl NativeWindowState {
 
     fn draw_background(&self, rt: &ID2D1HwndRenderTarget, brushes: &Brushes, layout: &Layout) {
         fill_rect(rt, layout.full, &brushes.black);
+        let horizon = layout.full.h * 0.42;
         fill_rect(
             rt,
-            UiRect::new(0.0, 0.0, layout.full.w, layout.full.h * 0.36),
+            UiRect::new(0.0, 0.0, layout.full.w, horizon),
             &brushes.top,
         );
+        draw_line(
+            rt,
+            0.0,
+            horizon,
+            layout.full.right(),
+            horizon,
+            &brushes.cyan_dim,
+            1.0,
+        );
+        // This receding grid is part of Nebula Cluster's visual language. It
+        // deliberately mirrors the perspective grid behind the Egui editor.
+        let step = 42.0 * layout.s;
+        let mut x = 0.0;
+        while x < layout.full.right() + step {
+            draw_line(
+                rt,
+                x,
+                horizon,
+                x - layout.full.w * 0.18,
+                layout.full.bottom(),
+                &brushes.grid,
+                0.7,
+            );
+            x += step;
+        }
         for index in 0..9 {
-            let y = layout.header.bottom() + index as f32 * 42.0 * layout.s;
+            let y = horizon + (index + 1) as f32 * step * 0.75;
             draw_line(rt, 0.0, y, layout.full.right(), y, &brushes.grid_soft, 0.6);
         }
     }
@@ -367,7 +395,7 @@ impl NativeWindowState {
         brushes: &Brushes,
         formats: &TextFormats,
         layout: &Layout,
-        snapshot: Snapshot,
+        _snapshot: Snapshot,
     ) {
         fill_rect(rt, layout.header, &brushes.panel);
         draw_line(
@@ -381,76 +409,34 @@ impl NativeWindowState {
         );
 
         let s = layout.s;
-        let logo = UiRect::new(18.0 * s, 15.0 * s, 34.0 * s, 34.0 * s);
-        fill_round(rt, logo, 6.0 * s, &brushes.cyan);
-        draw_text(
-            rt,
-            "NC",
-            logo,
-            &formats.body_bold,
-            &brushes.black,
-            Align::Center,
-        );
         draw_text(
             rt,
             "Nebula Cluster",
-            UiRect::new(62.0 * s, 10.0 * s, 260.0 * s, 28.0 * s),
+            UiRect::new(20.0 * s, 10.0 * s, 330.0 * s, 30.0 * s),
             &formats.title,
             &brushes.text_primary,
             Align::Leading,
         );
         draw_text(
             rt,
-            "Native Direct2D editor",
-            UiRect::new(64.0 * s, 36.0 * s, 260.0 * s, 18.0 * s),
+            "Made by Nebula Audio  |  v1.1",
+            UiRect::new(22.0 * s, 40.0 * s, 330.0 * s, 16.0 * s),
             &formats.small,
             &brushes.text_dim,
             Align::Leading,
         );
-
-        let status = if snapshot.bool(ControlId::FxBypass) {
-            "FX bypassed"
-        } else {
-            "Processor active"
-        };
-        let status_rect = UiRect::new(
-            layout.header.right() - 188.0 * s,
-            18.0 * s,
-            168.0 * s,
-            28.0 * s,
-        );
-        fill_round(
-            rt,
-            status_rect,
-            5.0 * s,
-            if snapshot.bool(ControlId::FxBypass) {
-                &brushes.red_soft
-            } else {
-                &brushes.card
-            },
-        );
-        stroke_round(
-            rt,
-            status_rect,
-            5.0 * s,
-            if snapshot.bool(ControlId::FxBypass) {
-                &brushes.red
-            } else {
-                &brushes.border
-            },
-            1.0,
-        );
         draw_text(
             rt,
-            status,
-            status_rect,
+            "64-bit f64 DSP",
+            UiRect::new(
+                layout.header.right() - 190.0 * s,
+                20.0 * s,
+                170.0 * s,
+                24.0 * s,
+            ),
             &formats.small,
-            if snapshot.bool(ControlId::FxBypass) {
-                &brushes.red
-            } else {
-                &brushes.text_secondary
-            },
-            Align::Center,
+            &brushes.cyan,
+            Align::Trailing,
         );
     }
 
@@ -503,9 +489,9 @@ impl NativeWindowState {
             brushes,
             formats,
             layout.delete_button,
-            "Delete",
+            "Name preset…",
             self.selected_preset.is_some(),
-            Accent::Red,
+            Accent::Cyan,
         );
 
         self.draw_button(
@@ -581,17 +567,22 @@ impl NativeWindowState {
             Accent::Cyan,
         );
 
-        let os = format_value(
-            ControlId::Oversampling,
-            snapshot.get(ControlId::Oversampling),
+        let oversampling = format!(
+            "Oversampling: {}",
+            format_value(
+                ControlId::Oversampling,
+                snapshot.get(ControlId::Oversampling)
+            )
         );
-        draw_text(
+        self.draw_button(
             rt,
-            &format!("Oversampling {os}"),
+            brushes,
+            formats,
             layout.toolbar_status,
-            &formats.small,
-            &brushes.text_dim,
-            Align::Leading,
+            &oversampling,
+            self.choice_dropdown
+                .is_some_and(|dropdown| dropdown.id == ControlId::Oversampling),
+            Accent::Amber,
         );
     }
 
@@ -1374,7 +1365,7 @@ impl NativeWindowState {
             return;
         }
         if layout.delete_button.contains(x, y) {
-            self.delete_selected_preset();
+            self.open_preset_save();
             invalidate(self.hwnd);
             return;
         }
@@ -1406,6 +1397,14 @@ impl NativeWindowState {
         }
         if layout.midi_button.contains(x, y) {
             self.toggle_midi_learn();
+            invalidate(self.hwnd);
+            return;
+        }
+        if layout.toolbar_status.contains(x, y) {
+            self.choice_dropdown = Some(ChoiceDropdown {
+                id: ControlId::Oversampling,
+                rect: layout.toolbar_status,
+            });
             invalidate(self.hwnd);
             return;
         }
@@ -1624,21 +1623,6 @@ impl NativeWindowState {
             self.push_undo_snapshot(before);
             self.set_control_value(input.id, value);
         }
-    }
-
-    fn delete_selected_preset(&mut self) {
-        let Some(index) = self.selected_preset else {
-            return;
-        };
-        if index < self.presets.len() {
-            self.presets.remove(index);
-        }
-        self.selected_preset = if self.presets.is_empty() {
-            None
-        } else {
-            Some(index.min(self.presets.len() - 1))
-        };
-        self.preset_menu_open = false;
     }
 
     fn handle_preset_menu_click(&mut self, x: f32, y: f32, layout: &Layout) -> bool {
@@ -2184,8 +2168,8 @@ impl Layout {
     fn new(w: f32, h: f32, _scale_hint: f32) -> Self {
         let s = (w / BASE_W).min(h / BASE_H).clamp(0.50, 1.4);
         let full = UiRect::new(0.0, 0.0, w, h);
-        let header = UiRect::new(0.0, 0.0, w, 58.0 * s);
-        let toolbar = UiRect::new(0.0, header.bottom(), w, 42.0 * s);
+        let header = UiRect::new(0.0, 0.0, w, 68.0 * s);
+        let toolbar = UiRect::new(0.0, header.bottom(), w, 44.0 * s);
         let margin = 12.0 * s;
         let gap = 9.0 * s;
         let meter_w = (164.0 * s).min(w * 0.22).max(120.0 * s);
@@ -2223,7 +2207,7 @@ impl Layout {
         let delete_button = UiRect::new(
             preset_button.right() + 7.0 * s,
             button_y,
-            68.0 * s,
+            116.0 * s,
             button_h,
         );
         let undo_button = UiRect::new(
