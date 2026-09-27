@@ -35,13 +35,13 @@ export CARGO_INCREMENTAL=0
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
 
 echo "[*] Building Apple Silicon"
-cargo build --release --target aarch64-apple-darwin
+cargo build --locked --release --target aarch64-apple-darwin
 
 echo "[*] Building Intel"
-cargo build --release --target x86_64-apple-darwin
+cargo build --locked --release --target x86_64-apple-darwin
 
 echo "[*] Creating CLAP and VST3 universal bundles"
-cargo xtask bundle-universal nebula_cluster --release
+cargo xtask bundle-universal nebula_cluster --release --locked
 
 PLUGIN_LIB="lib${PLUGIN_NAME}.dylib"
 AARCH64_LIB="target/aarch64-apple-darwin/release/${PLUGIN_LIB}"
