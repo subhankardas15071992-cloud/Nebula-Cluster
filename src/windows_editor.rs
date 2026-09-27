@@ -419,7 +419,7 @@ impl NativeWindowState {
         );
         draw_text(
             rt,
-            "Made by Nebula Audio  |  v1.1",
+            "Made by Nebula Audio  |  v1.0",
             UiRect::new(22.0 * s, 40.0 * s, 330.0 * s, 16.0 * s),
             &formats.small,
             &brushes.text_dim,
